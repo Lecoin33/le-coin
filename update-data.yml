@@ -1,0 +1,157 @@
+name: Mise à jour des données
+# Copie les lieux de la métropole (OpenStreetMap) dans le dossier data/.
+# Se lance à la main (onglet Actions) et chaque lundi matin.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Récupérer les données
+        run: |
+          cat > update-data.mjs <<'FIN_DU_SCRIPT'
+          // Copie des lieux de la métropole de Bordeaux depuis OpenStreetMap vers des
+          // fichiers JSON (données publiques, aucune donnée personnelle).
+          import fs from "node:fs";
+          const OUT = process.env.OUT || "data";
+          const PAUSE = Number(process.env.PAUSE_MS ?? 4000);
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const EP = ["https://overpass-api.de/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
+          const S0 = 44.72, W0 = -0.80, N0 = 44.99, E0 = -0.40, ROWS = 3, COLS = 3;
+          const today = new Date().toISOString().slice(0, 10);
+
+          async function post(q) {
+            for (let t = 0; t < 4; t++) {
+              for (const u of EP) {
+                try {
+                  const r = await fetch(u, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: "data=" + encodeURIComponent(q),
+                    signal: AbortSignal.timeout(240000),
+                  });
+                  if (r.ok) return await r.json();
+                  console.log("  réponse", r.status, "de", u);
+                } catch (e) {
+                  console.log("  échec", u, e.message);
+                }
+              }
+              await sleep(PAUSE * (t + 2));
+            }
+            throw new Error("Overpass indisponible");
+          }
+
+          const SL = { ph: "Pharmacie", md: "Médecin", de: "Dentiste", ho: "Hôpital ou clinique", au: "Autre soin" };
+          const SC = { ph: "Pharmacies", md: "Médecins", de: "Dentistes", ho: "Hôpitaux et cliniques", au: "Autres soins" };
+          function saType(t) {
+            const a = t.amenity, h = t.healthcare;
+            if (a === "pharmacy") return "ph";
+            if (a === "doctors" || h === "doctor") return "md";
+            if (a === "dentist" || h === "dentist") return "de";
+            if (a === "hospital" || a === "clinic" || h === "hospital" || h === "clinic") return "ho";
+            return "au";
+          }
+          const SHOP = { bakery: "Boulangerie", pastry: "Pâtisserie", butcher: "Boucherie", greengrocer: "Primeur", supermarket: "Supermarché", convenience: "Supérette", cheese: "Fromagerie", seafood: "Poissonnerie", deli: "Traiteur", wine: "Cave à vin", chocolate: "Chocolaterie" };
+          const shopSub = (x) => x === "bakery" || x === "pastry" ? "Boulangeries" : x === "butcher" ? "Boucheries" : x === "greengrocer" ? "Primeurs" : x === "supermarket" || x === "convenience" ? "Supermarchés" : "Autres";
+
+          // parts : filtres Overpass ; ty : type affiché ; k : code d'icône ; s : sous-catégorie
+          const CATS = {
+            shop: { parts: ['["shop"~"^(bakery|pastry|butcher|greengrocer|supermarket|convenience|cheese|seafood|deli|wine|chocolate)$"]'], ty: (t) => SHOP[t.shop] || "Commerce", k: (t) => t.shop, s: (t) => shopSub(t.shop) },
+            resto: { parts: ['["amenity"="restaurant"]'], ty: () => "Restaurant", k: () => "resto" },
+            bars: { parts: ['["amenity"~"^(bar|pub)$"]'], ty: () => "Bar", k: (t) => t.amenity },
+            club: { parts: ['["amenity"="nightclub"]'], ty: () => "Boîte de nuit", k: () => "club" },
+            culture: { parts: ['["amenity"~"^(cinema|theatre|arts_centre)$"]', '["tourism"~"^(museum|gallery)$"]'],
+              ty: (t) => ({ cinema: "Cinéma", theatre: "Théâtre", arts_centre: "Centre d’art" }[t.amenity]) || (t.tourism === "museum" ? "Musée" : t.tourism === "gallery" ? "Galerie" : "Lieu culturel"), k: (t) => t.amenity || t.tourism },
+            family: { parts: ['["leisure"="playground"]["name"]', '["tourism"~"^(zoo|aquarium|theme_park)$"]', '["leisure"="water_park"]'],
+              ty: (t) => t.leisure === "playground" ? "Aire de jeux" : t.tourism === "zoo" ? "Zoo" : t.tourism === "aquarium" ? "Aquarium" : t.tourism === "theme_park" ? "Parc d’attractions" : "Parc aquatique",
+              k: (t) => t.leisure === "playground" ? "playground" : (t.tourism || t.leisure) },
+            friends: { parts: ['["leisure"~"^(bowling_alley|escape_game|miniature_golf|amusement_arcade|trampoline_park)$"]'],
+              ty: (t) => ({ bowling_alley: "Bowling", escape_game: "Escape game", miniature_golf: "Mini-golf", amusement_arcade: "Salle de jeux", trampoline_park: "Parc de trampolines" }[t.leisure]) || "Loisir", k: (t) => t.leisure },
+            walks: { parts: ['["leisure"~"^(park|nature_reserve|garden)$"]["name"]', '["natural"="wood"]["name"]'],
+              ty: (t) => t.natural === "wood" ? "Forêt ou bois" : t.leisure === "nature_reserve" ? "Réserve naturelle" : t.leisure === "garden" ? "Jardin" : "Parc", k: (t) => t.natural === "wood" ? "wood" : t.leisure },
+            health: { parts: ['["amenity"~"^(doctors|dentist|pharmacy|hospital|clinic)$"]', '["healthcare"~"^(doctor|dentist|physiotherapist|laboratory|optometrist|psychotherapist|midwife|podiatrist|speech_therapist|blood_donation|hospital|clinic)$"]'],
+              ty: (t) => SL[saType(t)], k: (t) => saType(t), s: (t) => SC[saType(t)] },
+            park: { parts: ['["amenity"="parking"]["parking"~"^(multi-storey|underground)$"]', '["amenity"="parking"]["park_ride"]'], ty: () => "Parking", k: () => "park" },
+            taxi: { parts: ['["amenity"="taxi"]'], ty: () => "Station de taxis", k: () => "taxi" },
+          };
+
+          function cells() {
+            const out = [], dl = (N0 - S0) / ROWS, dn = (E0 - W0) / COLS;
+            for (let i = 0; i < ROWS; i++) for (let j = 0; j < COLS; j++)
+              out.push([S0 + i * dl, W0 + j * dn, S0 + (i + 1) * dl, W0 + (j + 1) * dn].map((v) => v.toFixed(5)).join(","));
+            return out;
+          }
+
+          function compact(e, c) {
+            const t = e.tags || {}, p = e.center || e;
+            if (p.lat == null || p.lon == null) return null;
+            const ad = [((t["addr:housenumber"] || "") + " " + (t["addr:street"] || "")).trim(), t["addr:city"] || ""].filter(Boolean).join(", ");
+            const o = { i: e.type[0] + e.id, la: +p.lat.toFixed(6), lo: +p.lon.toFixed(6), t: c.ty(t) };
+            const add = (k, v) => { if (v) o[k] = v; };
+            add("n", t.name); add("k", c.k && c.k(t)); add("s", c.s && c.s(t));
+            add("c", t.cuisine); add("p", t.capacity); add("f", t.fee); add("o", t.operator);
+            add("tel", t.phone || t["contact:phone"]); add("w", t.website || t["contact:website"]);
+            add("h", t.opening_hours); add("r", t.park_ride); add("a", ad);
+            return o;
+          }
+
+          fs.mkdirSync(OUT, { recursive: true });
+          let failed = 0;
+          for (const [k, c] of Object.entries(CATS)) {
+            console.log("Catégorie", k);
+            try {
+              const seen = new Map();
+              for (const b of cells()) {
+                const q = "[out:json][timeout:200];(" + c.parts.map((x) => "nw" + x + "(" + b + ");").join("") + ");out center tags;";
+                const j = await post(q);
+                for (const e of j.elements || []) {
+                  const o = compact(e, c);
+                  if (o && !seen.has(o.i)) seen.set(o.i, o);
+                }
+                await sleep(PAUSE);
+              }
+              const items = [...seen.values()];
+              fs.writeFileSync(OUT + "/" + k + ".json", JSON.stringify({ u: today, n: items.length, items }));
+              console.log("  ", items.length, "lieux");
+            } catch (e) {
+              failed++;
+              console.log("  ÉCHEC", k, e.message);
+            }
+          }
+
+          console.log("Tracé des trams");
+          try {
+            const j = await post('[out:json][timeout:200];rel["route"="tram"](44.70,-0.82,45.00,-0.38);out geom;');
+            const rels = (j.elements || []).filter((e) => e.members).map((e) => {
+              const t = e.tags || {}, ways = [];
+              for (const m of e.members)
+                if (m.type === "way" && m.geometry && m.geometry.length > 1)
+                  ways.push(m.geometry.map((g) => [+g.lat.toFixed(5), +g.lon.toFixed(5)]));
+              const col = t.colour || "";
+              return { ref: t.ref || t.name || "", col: /^#?[0-9a-f]{3,6}$/i.test(col) ? (col[0] === "#" ? col : "#" + col) : "", ways };
+            }).filter((r) => r.ways.length);
+            fs.writeFileSync(OUT + "/tram.json", JSON.stringify({ u: today, rels }));
+            console.log("  ", rels.length, "relations");
+          } catch (e) {
+            failed++;
+            console.log("  ÉCHEC tram", e.message);
+          }
+          if (failed) process.exitCode = 1;
+          FIN_DU_SCRIPT
+          node update-data.mjs
+      - name: Enregistrer
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || (git commit -m "Mise à jour des données" && git push)
